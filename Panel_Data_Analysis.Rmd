@@ -1,0 +1,1334 @@
+---
+title: "ST312 FLFP Panel Analysis"
+output: pdf_document
+date: "2026-04-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup
+
+## Working Directory and Libraries
+
+```{r libraries}
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/LSE/LSE YEAR 3/WT/ST312")
+
+library(MASS)
+library(glmnet)
+library(tidyverse)
+library(mice)
+library(mitools)
+library(randomForest)
+library(estimatr)
+library(sandwich)
+library(lmtest)
+library(car)
+library(margins)
+library(ggplot2)
+library(lme4)
+library(plm)
+library(ggcorrplot)
+library(patchwork)
+library(ggmice)
+library(glmnet)
+```
+
+## LoadING Datasets
+
+```{r load-data}
+df_flfp      <- read_csv("female-labor-force-participation-oecd.csv")
+df_dep       <- read_csv("age-dependency-ratio-young-of-working-age-population.csv")
+df_fert      <- read_csv("children-born-per-woman.csv")
+df_gendergap <- read_csv("gender-gap-education-levels.csv")
+df_empower   <- read_csv("women-political-empowerment-index.csv")
+df_gdp       <- read_csv("gdp-per-capita-worldbank.csv")
+```
+
+# Data Cleaning and Merging
+
+## Clean Individual Datasets
+
+`gender_gap` is computed as the difference in tertiary enrolment ratios (female minus male). A regions lookup table is extracted from the GDP dataset for later merging.
+
+```{r clean-data}
+df_flfp_clean <- df_flfp %>%
+  rename(country = Entity, year = Year,
+         flfp = `Female labor force participation rate (OWID based on OECD 2017 and others)`) %>%
+  dplyr::select(country, year, flfp)
+
+df_dep_clean <- df_dep %>%
+  rename(country = Entity, year = Year,
+         age_dep = `Child dependency ratio - Sex: all - Variant: estimates`) %>%
+  dplyr::select(country, year, age_dep)
+
+df_fert_clean <- df_fert %>%
+  rename(country = Entity, year = Year,
+         fertility = `Fertility rate (period), historical`) %>%
+  dplyr::select(country, year, fertility)
+
+df_gendergap_clean <- df_gendergap %>%
+  rename(country = Entity, year = Year) %>%
+  mutate(gender_gap = `Combined gross enrolment ratio for tertiary education, female` -
+           `Combined gross enrolment ratio for tertiary education, male`) %>%
+  dplyr::select(country, year, gender_gap)
+
+df_empower_clean <- df_empower %>%
+  rename(country = Entity, year = Year,
+         pol_emp = `Women's political empowerment index (central estimate)`) %>%
+  dplyr::select(country, year, pol_emp)
+
+df_gdp_clean <- df_gdp %>%
+  rename(country = Entity, year = Year,
+         gdp_pc = `GDP per capita, PPP (constant 2021 international $)`) %>%
+  dplyr::select(country, year, gdp_pc)
+
+regions <- df_gdp %>%
+  dplyr::select(country = Entity, region = `World regions according to OWID`) %>%
+  filter(!is.na(region)) %>%
+  distinct(country, region)
+```
+
+## Merge and Filter Panel
+
+```{r merge-panel}
+panel <- df_flfp_clean %>%
+  left_join(df_fert_clean,      by = c("country", "year")) %>%
+  left_join(df_dep_clean,       by = c("country", "year")) %>%
+  left_join(df_gendergap_clean, by = c("country", "year")) %>%
+  left_join(df_empower_clean,   by = c("country", "year")) %>%
+  left_join(df_gdp_clean,       by = c("country", "year")) %>%
+  left_join(regions,            by = "country") %>%
+  filter(year >= 1990, year <= 2020)
+```
+
+## Missingness Check
+
+```{r missingness-check}
+missingness_check <- panel %>%
+  summarise(
+    flfp_missing       = mean(is.na(flfp)),
+    fertility_missing  = mean(is.na(fertility)),
+    age_dep_missing    = mean(is.na(age_dep)),
+    gender_gap_missing = mean(is.na(gender_gap)),
+    pol_emp_missing    = mean(is.na(pol_emp)),
+    gdp_pc_missing     = mean(is.na(gdp_pc))
+  )
+
+print(missingness_check)
+```
+
+# Multiple Imputation (MICE)
+
+## MAR Assumption Testing
+
+```{r mar-testing}
+md_pattern <- plot_pattern(panel %>%
+                             dplyr::select(flfp, fertility, age_dep,
+                                           gender_gap, pol_emp, gdp_pc),
+                           rotate = TRUE)
+ggsave("final_figure_A2_missingness_pattern.png", md_pattern,
+       width = 9, height = 5, dpi = 300)
+
+panel <- panel %>%
+  mutate(gender_gap_missing = as.numeric(is.na(gender_gap)))
+
+missingness_model <- glm(gender_gap_missing ~ year + flfp + fertility + age_dep + pol_emp,
+                         data = panel, family = binomial)
+
+missingness_model
+```
+
+## Run MICE (m = 28, PMM)
+
+```{r mice-imputation}
+panel_imp <- panel %>%
+  group_by(country) %>%
+  mutate(
+    mean_fertility  = mean(fertility,  na.rm = TRUE),
+    mean_age_dep    = mean(age_dep,    na.rm = TRUE),
+    mean_gender_gap = mean(gender_gap, na.rm = TRUE),
+    mean_pol_emp    = mean(pol_emp,    na.rm = TRUE),
+    mean_gdp_pc     = mean(gdp_pc,     na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(country_id = as.numeric(factor(country))) %>%
+  dplyr::select(country_id, year, flfp, fertility, age_dep,
+                gender_gap, pol_emp, gdp_pc,
+                mean_fertility, mean_age_dep, mean_gender_gap,
+                mean_pol_emp, mean_gdp_pc)
+
+set.seed(12345)
+imp_init    <- mice(panel_imp, m = 1, maxit = 0, printFlag = FALSE)
+pred_matrix <- imp_init$predictorMatrix
+
+mean_vars <- c("mean_fertility", "mean_age_dep", "mean_gender_gap",
+               "mean_pol_emp", "mean_gdp_pc")
+pred_matrix[mean_vars, ] <- 0   # mean vars never imputed
+pred_matrix[, mean_vars] <- 1   # mean vars predict all others
+pred_matrix["country_id", ] <- 0
+pred_matrix["year", ]       <- 0
+
+imp <- mice(panel_imp, m = 28, method = "pmm", maxit = 10,
+            predictorMatrix = pred_matrix, printFlag = FALSE)
+```
+
+## Convergence Diagnostic
+
+```{r mice-convergence}
+final_convergence <- plot_trace(imp, "gdp_pc")
+ggsave("final_mice_convergence_A2.png", final_convergence,
+       width = 8, height = 4, dpi = 300)
+```
+
+## Extract Imputed Datasets
+
+```{r extract-imp-list}
+imp_list <- lapply(1:28, function(i) {
+  df <- complete(imp, i)
+  df$country <- panel$country
+  df$region  <- panel$region
+  df %>% dplyr::select(-starts_with("mean_"))
+})
+
+imp1 <- imp_list[[1]]
+
+summary(imp1$pol_emp)
+summary(imp1$gender_gap)
+```
+
+# Descriptive Statistics
+
+## Pooled Descriptive Statistics (across 28 imputations)
+
+```{r desc-stats}
+desc_stats_list <- lapply(imp_list, function(df) {
+  df %>%
+    summarise(across(c(flfp, pol_emp, fertility, age_dep, gender_gap, gdp_pc),
+                     list(n    = ~sum(!is.na(.)),
+                          mean = ~mean(., na.rm = TRUE),
+                          sd   = ~sd(.,   na.rm = TRUE),
+                          min  = ~min(.,  na.rm = TRUE),
+                          max  = ~max(.,  na.rm = TRUE)),
+                     .names = "{.col}_{.fn}"))
+})
+
+desc_stats <- bind_rows(desc_stats_list) %>% summarise(across(everything(), mean))
+
+desc_table <- data.frame(
+  Variable = c("FLFP (%)", "Political Empowerment (0-1)", "Fertility (children/woman)",
+               "Age Dependency Ratio", "Gender Gap in Tertiary Edu.", "GDP per capita (PPP)"),
+  N    = c(desc_stats$flfp_n,    desc_stats$pol_emp_n,    desc_stats$fertility_n,
+           desc_stats$age_dep_n, desc_stats$gender_gap_n, desc_stats$gdp_pc_n),
+  Mean = round(c(desc_stats$flfp_mean,    desc_stats$pol_emp_mean,    desc_stats$fertility_mean,
+                 desc_stats$age_dep_mean, desc_stats$gender_gap_mean, desc_stats$gdp_pc_mean), 2),
+  SD   = round(c(desc_stats$flfp_sd,    desc_stats$pol_emp_sd,    desc_stats$fertility_sd,
+                 desc_stats$age_dep_sd, desc_stats$gender_gap_sd, desc_stats$gdp_pc_sd), 2),
+  Min  = round(c(desc_stats$flfp_min,    desc_stats$pol_emp_min,    desc_stats$fertility_min,
+                 desc_stats$age_dep_min, desc_stats$gender_gap_min, desc_stats$gdp_pc_min), 2),
+  Max  = round(c(desc_stats$flfp_max,    desc_stats$pol_emp_max,    desc_stats$fertility_max,
+                 desc_stats$age_dep_max, desc_stats$gender_gap_max, desc_stats$gdp_pc_max), 2)
+)
+
+desc_table
+```
+
+## Correlation Matrix (pooled across 28 imputations)
+
+```{r correlation-matrix}
+cor_list <- lapply(imp_list, function(df) {
+  cor(df %>% dplyr::select(flfp, pol_emp, fertility, age_dep, gender_gap, gdp_pc),
+      use = "complete.obs")
+})
+cor_matrix <- round(Reduce(`+`, cor_list) / length(cor_list), 2)
+
+rownames(cor_matrix) <- colnames(cor_matrix) <- c("FLFP", "Pol. Emp", "Fertility",
+                                                    "Age Dep", "Gender Gap", "GDP pc")
+
+corr <- ggcorrplot(cor_matrix,
+           type = "lower",
+           lab = TRUE,
+           lab_size = 3.5,
+           colors = c("#d73027", "white", "#4575b4"),
+           ggtheme = theme_minimal())
+ggsave("final_figure_A2_correlation_matrix.png", corr,
+       width = 7, height = 6, dpi = 300)
+
+corr
+```
+
+# Helper Functions
+
+## pool_dk(): Pool PLM Models with Driscoll-Kraay SEs
+
+Within-variance uses Driscoll-Kraay SEs via `vcovSCC` (HC1, group-clustered). `coef_avg` and `Vtot` are attached as attributes for use in `wald_pool()`.
+
+```{r pool-dk-function}
+pool_dk <- function(plm_models) {
+  m        <- length(plm_models)
+  coef_mat <- do.call(rbind, lapply(plm_models, coef))
+  coef_avg <- colMeans(coef_mat)
+
+  vcov_w <- Reduce(`+`, lapply(plm_models, function(m_i) {
+    vcovSCC(m_i, type = "HC1", cluster = "group")
+  })) / m
+
+  B      <- var(coef_mat)
+  Vtot   <- vcov_w + (1 + 1 / m) * B
+  ses    <- sqrt(diag(Vtot))
+  tvals  <- coef_avg / ses
+  lambda <- (1 + 1 / m) * diag(B) / diag(Vtot)
+  df_br  <- (m - 1) / lambda^2
+  pvals  <- 2 * pt(abs(tvals), df = df_br, lower.tail = FALSE)
+
+  out <- data.frame(
+    Coefficient = round(coef_avg, 3),
+    SE          = round(ses,      3),
+    t_value     = round(tvals,    3),
+    p_value     = round(pvals,    3),
+    row.names   = names(coef_avg)
+  )
+  attr(out, "coef_avg") <- coef_avg
+  attr(out, "Vtot")     <- Vtot
+  out
+}
+```
+
+## wald_pool(): Wald Chi-Squared Test on Pooled Estimates
+
+```{r wald-pool-function}
+wald_pool <- function(dk_result, restrictions) {
+  coef_avg <- attr(dk_result, "coef_avg")
+  Vtot     <- attr(dk_result, "Vtot")
+
+  missing_coefs <- restrictions[!restrictions %in% names(coef_avg)]
+  if (length(missing_coefs) > 0)
+    stop("Coefficients not found in model: ", paste(missing_coefs, collapse = ", "))
+
+  q     <- length(restrictions)
+  k     <- length(coef_avg)
+  R     <- matrix(0, nrow = q, ncol = k,
+                  dimnames = list(restrictions, names(coef_avg)))
+  for (i in seq_along(restrictions)) R[i, restrictions[i]] <- 1
+
+  r_beta <- R %*% coef_avg
+  RVR    <- R %*% Vtot %*% t(R)
+  W      <- as.numeric(t(r_beta) %*% solve(RVR) %*% r_beta)
+  p_val  <- pchisq(W, df = q, lower.tail = FALSE)
+
+  data.frame(chi2 = round(W, 3), df = q, p_value = round(p_val, 4))
+}
+```
+
+## Convert to pdata.frame
+
+```{r imp-pdata}
+imp_pdata <- lapply(imp_list, function(df) pdata.frame(df, index = c("country", "year")))
+```
+
+# RQ1: Key Determinants of FLFP
+
+## Variable Selection
+
+Within-transform for FE-consistent variable selection.
+
+```{r variable-selection-within}
+imp1_within <- imp1 %>%
+  group_by(country) %>%
+  mutate(across(c(flfp, pol_emp, fertility, age_dep, gender_gap),
+                list(w = ~ . - mean(., na.rm = TRUE)))) %>%
+  ungroup()
+
+m_full_w <- lm(flfp_w ~ pol_emp_w + fertility_w + age_dep_w + gender_gap_w +
+                 factor(year), data = imp1_within)
+
+m_null_w <- lm(flfp_w ~ 1, data = imp1_within)
+
+stepwise_backward <- stepAIC(m_full_w, direction = "backward", trace = FALSE)
+stepwise_forward  <- stepAIC(m_null_w,
+                             scope = list(lower = m_null_w, upper = m_full_w),
+                             direction = "forward", trace = FALSE)
+stepwise_both     <- stepAIC(m_null_w,
+                             scope = list(lower = m_null_w, upper = m_full_w),
+                             direction = "both",    trace = FALSE)
+
+formula(stepwise_backward)
+formula(stepwise_forward)
+formula(stepwise_both)
+```
+
+```{r lasso-stability}
+X_lasso <- model.matrix(flfp_w ~ pol_emp_w + fertility_w + age_dep_w + gender_gap_w,
+                        data = imp1_within)[, -1]
+y_lasso <- imp1_within$flfp_w
+
+# LASSO: stability across all 28 imputations
+set.seed(456)
+lasso_inclusion <- lapply(imp_list, function(df) {
+  df_w <- df %>%
+    group_by(country) %>%
+    mutate(across(c(flfp, pol_emp, fertility, age_dep, gender_gap),
+                  list(w = ~ . - mean(., na.rm = TRUE)))) %>%
+    ungroup()
+  X     <- model.matrix(flfp_w ~ pol_emp_w + fertility_w + age_dep_w + gender_gap_w,
+                        data = df_w)[, -1]
+  y     <- df_w$flfp_w
+  cv    <- cv.glmnet(X, y, alpha = 1)
+  coefs <- coef(cv, s = "lambda.1se")[-1, ]
+  as.integer(coefs != 0)
+})
+lasso_stability <- data.frame(
+  Variable    = c("pol_emp", "fertility", "age_dep", "gender_gap"),
+  Pct_NonZero = rowMeans(do.call(cbind, lasso_inclusion)) * 100
+)
+```
+
+```{r stepwise-stability}
+set.seed(456)
+stepwise_inclusion <- lapply(imp_list, function(df) {
+  df_w <- df %>%
+    group_by(country) %>%
+    mutate(across(c(flfp, pol_emp, fertility, age_dep, gender_gap),
+                  list(w = ~ . - mean(., na.rm = TRUE)))) %>%
+    ungroup()
+  m_full_i <- lm(flfp_w ~ pol_emp_w + fertility_w + age_dep_w + gender_gap_w +
+                   factor(year), data = df_w)
+  m_null_i <- lm(flfp_w ~ 1, data = df_w)
+  step_m   <- stepAIC(m_full_i, direction = "backward", trace = FALSE)
+  vars     <- c("pol_emp_w", "fertility_w", "age_dep_w", "gender_gap_w")
+  as.integer(vars %in% names(coef(step_m)))
+})
+stepwise_stability <- data.frame(
+  Variable     = c("pol_emp", "fertility", "age_dep", "gender_gap"),
+  Pct_Selected = rowMeans(do.call(cbind, stepwise_inclusion)) * 100
+)
+```
+
+```{r ridge-rf}
+# Ridge (single imputation)
+set.seed(456)
+cv_ridge       <- cv.glmnet(X_lasso, y_lasso, alpha = 0)
+ridge_coef_min <- coef(cv_ridge, s = "lambda.min")
+
+# Random Forest (averaged across all 28 imputations)
+set.seed(456)
+rf_results <- lapply(1:28, function(i) {
+  rf_data <- imp_list[[i]] %>%
+    drop_na(flfp, pol_emp, fertility, age_dep, gender_gap) %>%
+    mutate(year_fct = factor(year))
+  rf <- randomForest(flfp ~ pol_emp + fertility + age_dep + gender_gap + year_fct,
+                     data = rf_data, ntree = 500, importance = TRUE)
+  data.frame(variable      = rownames(importance(rf)),
+             IncMSE        = importance(rf)[, "%IncMSE"],
+             IncNodePurity = importance(rf)[, "IncNodePurity"])
+})
+
+imp_df <- rf_results %>%
+  bind_rows() %>%
+  group_by(variable) %>%
+  summarise(`%IncMSE`     = mean(IncMSE),
+            IncNodePurity = mean(IncNodePurity), .groups = "drop") %>%
+  arrange(desc(`%IncMSE`))
+```
+
+```{r variable-selection-comparison}
+variable_selection_comparison <- data.frame(
+  Variable             = c("pol_emp", "fertility", "age_dep", "gender_gap"),
+  Stepwise_PctSelected = stepwise_stability$Pct_Selected,
+  LASSO_PctNonZero     = lasso_stability$Pct_NonZero,
+  Ridge_Coef           = round(c(ridge_coef_min["pol_emp_w",],
+                                 ridge_coef_min["fertility_w",],
+                                 ridge_coef_min["age_dep_w",],
+                                 ridge_coef_min["gender_gap_w",]), 3),
+  RF_IncMSE            = round(imp_df$`%IncMSE`[match(
+    c("pol_emp","fertility","age_dep","gender_gap"), imp_df$variable)], 2)
+)
+
+print(variable_selection_comparison)
+```
+
+```{r variable-selection-plots}
+var_sel_long <- variable_selection_comparison %>%
+  pivot_longer(cols = c(Stepwise_PctSelected, LASSO_PctNonZero, RF_IncMSE),
+               names_to = "Method", values_to = "Value") %>%
+  mutate(Method = case_when(
+    Method == "Stepwise_PctSelected" ~ "Stepwise (% selected)",
+    Method == "LASSO_PctNonZero"     ~ "LASSO (% non-zero)",
+    Method == "RF_IncMSE"            ~ "RF (%IncMSE)"
+  ))
+
+p1 <- ggplot(var_sel_long, aes(x = Variable, y = Value, fill = Method)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "", y = "Value", fill = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c(
+    "Stepwise (% selected)" = "#378ADD",
+    "LASSO (% non-zero)"    = "#1D9E75",
+    "RF (%IncMSE)"          = "#7F77DD"))
+
+ggsave("final_figure_2_3_variable_selection.png", p1, width = 8, height = 4.5, dpi = 300)
+
+p2 <- ggplot(variable_selection_comparison, aes(x = Variable, y = Ridge_Coef)) +
+  geom_bar(stat = "identity", fill = "#EF9F27") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(x = "", y = "Coefficient") +
+  theme_minimal()
+
+ggsave("final_figure_2_4_ridge_coefficients.png", p2, width = 8, height = 3.5, dpi = 300)
+
+p1
+p2
+```
+
+## Two-Way FE: Primary Specification
+
+```{r rq1-main-fe}
+models_rq1_fe <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+
+rq1_dk <- pool_dk(models_rq1_fe)
+rq1_dk
+
+# Rubin's only supplement
+coef_mat  <- do.call(rbind, lapply(models_rq1_fe, coef))
+vcov_list <- lapply(models_rq1_fe, vcov)
+coef_avg  <- colMeans(coef_mat)
+Ubar      <- Reduce(`+`, vcov_list) / length(vcov_list)
+B         <- var(coef_mat)
+m         <- length(models_rq1_fe)
+Vtot_rubin <- Ubar + (1 + 1/m) * B
+pooled_rq1_fe <- data.frame(
+  Coefficient = round(coef_avg, 3),
+  SE          = round(sqrt(diag(Vtot_rubin)), 3)
+)
+pooled_rq1_fe
+```
+
+## Multicollinearity Sensitivity
+
+```{r rq1-multicollinearity}
+m_vif_within <- lm(flfp_w ~ pol_emp_w + fertility_w + age_dep_w + gender_gap_w,
+                   data = imp1_within)
+vif_within <- vif(m_vif_within)
+
+models_rq1_fert_only <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp + fertility + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+rq1_fert_only_dk <- pool_dk(models_rq1_fert_only)
+
+models_rq1_age_only <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+rq1_age_only_dk <- pool_dk(models_rq1_age_only)
+
+print(vif_within)
+print(rq1_fert_only_dk)
+print(rq1_age_only_dk)
+```
+
+## Model Fit Comparison
+
+`plm` does not expose R²/AIC/BIC. `lm` with explicit dummies is numerically identical to the `plm` within estimator and does expose these measures.
+
+```{r rq1-model-fit}
+m1_fe_single <- lm(flfp ~ fertility + age_dep + gender_gap +
+                     factor(country) + factor(year), data = imp1)
+m2_fe_single <- lm(flfp ~ pol_emp + fertility + age_dep + gender_gap +
+                     factor(country) + factor(year), data = imp1)
+m3_fe_single <- lm(flfp ~ pol_emp * age_dep + fertility + gender_gap +
+                     factor(country) + factor(year), data = imp1)
+
+model_fit_fe <- data.frame(
+  Model    = c("M1: No pol_emp (FE)", "M2: + pol_emp (FE)", "M3: + interaction (FE)"),
+  R_sq     = round(c(summary(m1_fe_single)$r.squared,
+                     summary(m2_fe_single)$r.squared,
+                     summary(m3_fe_single)$r.squared), 4),
+  Adj_R_sq = round(c(summary(m1_fe_single)$adj.r.squared,
+                     summary(m2_fe_single)$adj.r.squared,
+                     summary(m3_fe_single)$adj.r.squared), 4),
+  AIC      = round(c(AIC(m1_fe_single), AIC(m2_fe_single), AIC(m3_fe_single)), 1),
+  BIC      = round(c(BIC(m1_fe_single), BIC(m2_fe_single), BIC(m3_fe_single)), 1)
+)
+
+ftest_m1_m2_fe <- anova(m1_fe_single, m2_fe_single)
+ftest_m2_m3_fe <- anova(m2_fe_single, m3_fe_single)
+
+# Pooled OLS baseline
+models_rq1_ols <- lapply(imp_list, function(df) {
+  lm(flfp ~ pol_emp + fertility + age_dep + gender_gap + factor(year), data = df)
+})
+pooled_rq1_ols <- pool(as.mira(models_rq1_ols))
+
+print(model_fit_fe)
+print(ftest_m1_m2_fe)
+print(ftest_m2_m3_fe)
+print(summary(pooled_rq1_ols))
+wald_pool(rq1_dk, restrictions = "pol_emp")
+```
+
+# RQ2: Political Empowerment and Demographic Interaction
+
+## Two-Way FE Interaction Model
+
+```{r rq2-interaction}
+models_rq2_fe <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp * age_dep + fertility + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+rq2_dk        <- pool_dk(models_rq2_fe)
+pooled_rq2_fe <- pool(as.mira(models_rq2_fe))
+
+print(rq2_dk)
+print(pooled_rq2_fe)
+wald_pool(rq2_dk, restrictions = "pol_emp:age_dep")
+```
+
+## Marginal Effects
+
+```{r rq2-marginal-effects}
+me_results_fe <- lapply(seq_along(models_rq2_fe), function(i) {
+  beta_pol <- coef(models_rq2_fe[[i]])["pol_emp"]
+  beta_int <- coef(models_rq2_fe[[i]])["pol_emp:age_dep"]
+  age_vals <- quantile(imp_list[[i]]$age_dep, probs = c(0.25, 0.50, 0.75))
+  data.frame(percentile      = c("25th", "50th", "75th"),
+             age_dep_value   = as.numeric(age_vals),
+             marginal_effect = as.numeric(beta_pol + beta_int * age_vals))
+})
+
+me_pooled_fe <- me_results_fe %>%
+  bind_rows() %>%
+  group_by(percentile) %>%
+  summarise(age_dep_value   = mean(age_dep_value),
+            marginal_effect = mean(marginal_effect),
+            .groups         = "drop")
+
+print(me_pooled_fe)
+
+beta_pol_avg <- mean(sapply(models_rq2_fe, function(m) coef(m)["pol_emp"]))
+beta_int_avg <- mean(sapply(models_rq2_fe, function(m) coef(m)["pol_emp:age_dep"]))
+
+age_dep_seq <- seq(min(imp1$age_dep), max(imp1$age_dep), length.out = 100)
+me_data_fe  <- data.frame(age_dep         = age_dep_seq,
+                          marginal_effect = beta_pol_avg + beta_int_avg * age_dep_seq)
+
+# SE: full Rubin's-rules total variance (within DK + between-imputation)
+vcov_w_rq2 <- Reduce(`+`, lapply(models_rq2_fe, function(m) {
+  vcovSCC(m, type = "HC1", cluster = "group")
+})) / length(models_rq2_fe)
+
+coef_mat_rq2   <- do.call(rbind, lapply(models_rq2_fe, coef))
+B_rq2          <- var(coef_mat_rq2)
+m_imp          <- length(models_rq2_fe)
+vcov_total_rq2 <- vcov_w_rq2 + (1 + 1 / m_imp) * B_rq2
+
+var_pol     <- vcov_total_rq2["pol_emp",         "pol_emp"]
+var_int     <- vcov_total_rq2["pol_emp:age_dep", "pol_emp:age_dep"]
+cov_pol_int <- vcov_total_rq2["pol_emp",         "pol_emp:age_dep"]
+
+me_data_fe$se       <- sqrt(var_pol + me_data_fe$age_dep^2 * var_int +
+                              2 * me_data_fe$age_dep * cov_pol_int)
+me_data_fe$ci_lower <- me_data_fe$marginal_effect - 1.96 * me_data_fe$se
+me_data_fe$ci_upper <- me_data_fe$marginal_effect + 1.96 * me_data_fe$se
+
+zero_cross    <- if (beta_int_avg != 0) -beta_pol_avg / beta_int_avg else NA
+zero_in_range <- !is.na(zero_cross) &&
+  zero_cross > min(age_dep_seq) && zero_cross < max(age_dep_seq)
+
+percentiles_fe <- quantile(imp1$age_dep, probs = c(0.25, 0.5, 0.75))
+
+p_marginal_fe <- ggplot(me_data_fe, aes(x = age_dep, y = marginal_effect)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper, fill = "95% CI"), alpha = 0.25) +
+  geom_line(aes(colour = "Marginal effect"), linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = percentiles_fe, linetype = "dotted", colour = "grey60") +
+  annotate("text", x = percentiles_fe[1], y = 28, label = "25th pct",
+           size = 3.2, hjust = -0.15, colour = "grey30") +
+  annotate("text", x = percentiles_fe[2], y = 28, label = "50th pct",
+           size = 3.2, hjust = -0.15, colour = "grey30") +
+  annotate("text", x = percentiles_fe[3], y = 28, label = "75th pct",
+           size = 3.2, hjust = -0.15, colour = "grey30") +
+  scale_colour_manual(name = NULL, values = c("Marginal effect" = "steelblue")) +
+  scale_fill_manual(name = NULL, values = c("95% CI" = "steelblue")) +
+  labs(
+    x = "Age Dependency Ratio (children per working-age adult)",
+    y = "Marginal Effect on FLFP (percentage points)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    plot.title         = element_text(face = "bold", size = 13),
+    plot.subtitle      = element_text(size = 10, colour = "grey30"),
+    panel.grid.minor   = element_blank()
+  )
+
+ggsave("final_figure_3_4_marginal_effects.png", p_marginal_fe, width = 9, height = 5.5, dpi = 300)
+print(p_marginal_fe)
+```
+
+# RQ3: Determinants by Income Level
+
+## Add Income Group Variables
+
+```{r add-income-groups}
+imp_list <- lapply(imp_list, function(df) {
+  df %>% mutate(
+    log_gdp_pc     = log(gdp_pc),
+    income_tercile = ntile(gdp_pc, 3),
+    income_group   = factor(case_when(
+      income_tercile == 1 ~ "Low tercile",
+      income_tercile == 2 ~ "Mid tercile",
+      income_tercile == 3 ~ "High tercile"
+    ), levels = c("Low tercile", "Mid tercile", "High tercile"))
+  )
+})
+
+imp1 <- imp_list[[1]]
+
+# Rebuild pdata frames with log_gdp_pc and income_group
+imp_pdata <- lapply(imp_list, function(df) pdata.frame(df, index = c("country", "year")))
+```
+
+## RQ3a: Continuous Income Interaction
+
+```{r rq3-continuous}
+models_rq3_cont_full <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ (pol_emp + fertility + age_dep + gender_gap) * log_gdp_pc,
+      data = pd, model = "within", effect = "twoways")
+})
+rq3_cont_dk          <- pool_dk(models_rq3_cont_full)
+pooled_rq3_cont_full <- pool(as.mira(models_rq3_cont_full))
+
+models_rq3_cont_pol <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp * log_gdp_pc + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_cont_pol <- pool(as.mira(models_rq3_cont_pol))
+
+models_rq3_cont_fert <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ fertility * log_gdp_pc + pol_emp + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_cont_fert <- pool(as.mira(models_rq3_cont_fert))
+
+models_rq3_cont_age <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ age_dep * log_gdp_pc + pol_emp + fertility + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_cont_age <- pool(as.mira(models_rq3_cont_age))
+
+models_rq3_cont_gender <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ gender_gap * log_gdp_pc + pol_emp + fertility + age_dep,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_cont_gender <- pool(as.mira(models_rq3_cont_gender))
+
+lh_cont_all_interactions <- wald_pool(rq3_cont_dk,
+                                      c("pol_emp:log_gdp_pc", "fertility:log_gdp_pc",
+                                        "age_dep:log_gdp_pc", "gender_gap:log_gdp_pc"))
+lh_cont_pol_emp    <- wald_pool(rq3_cont_dk, "pol_emp:log_gdp_pc")
+lh_cont_fertility  <- wald_pool(rq3_cont_dk, "fertility:log_gdp_pc")
+lh_cont_age_dep    <- wald_pool(rq3_cont_dk, "age_dep:log_gdp_pc")
+lh_cont_gender_gap <- wald_pool(rq3_cont_dk, "gender_gap:log_gdp_pc")
+
+print(rq3_cont_dk)
+print(lh_cont_all_interactions)
+print(lh_cont_pol_emp)
+print(lh_cont_fertility)
+print(lh_cont_age_dep)
+print(lh_cont_gender_gap)
+```
+
+## RQ3b: Income Tercile Models
+
+```{r rq3-tercile-models}
+imp_pdata_lower  <- lapply(imp_list, function(df)
+  pdata.frame(df %>% filter(income_group == "Low tercile"),  index = c("country","year")))
+imp_pdata_middle <- lapply(imp_list, function(df)
+  pdata.frame(df %>% filter(income_group == "Mid tercile"),  index = c("country","year")))
+imp_pdata_higher <- lapply(imp_list, function(df)
+  pdata.frame(df %>% filter(income_group == "High tercile"), index = c("country","year")))
+
+models_lower  <- lapply(imp_pdata_lower,  function(pd)
+  plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways"))
+models_middle <- lapply(imp_pdata_middle, function(pd)
+  plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways"))
+models_higher <- lapply(imp_pdata_higher, function(pd)
+  plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways"))
+
+lower_dk  <- pool_dk(models_lower)
+middle_dk <- pool_dk(models_middle)
+higher_dk <- pool_dk(models_higher)
+
+pooled_lower  <- pool(as.mira(models_lower))
+pooled_middle <- pool(as.mira(models_middle))
+pooled_higher <- pool(as.mira(models_higher))
+
+coef_by_income <- data.frame(
+  Variable    = c("pol_emp", "fertility", "age_dep", "gender_gap"),
+  Low_Tercile  = round(lower_dk [c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3),
+  Mid_Tercile  = round(middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3),
+  High_Tercile = round(higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3)
+)
+```
+
+## RQ3c: Full Interaction Model (Terciles)
+
+```{r rq3-full-interaction}
+models_rq3_full_interact <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ (pol_emp + fertility + age_dep + gender_gap) * income_group,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_full <- pool(as.mira(models_rq3_full_interact))
+rq3_full_dk     <- pool_dk(models_rq3_full_interact)
+
+models_rq3_pol <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ pol_emp * income_group + fertility + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_pol <- pool(as.mira(models_rq3_pol))
+
+models_rq3_fert <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ fertility * income_group + pol_emp + age_dep + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_fert <- pool(as.mira(models_rq3_fert))
+
+models_rq3_age <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ age_dep * income_group + pol_emp + fertility + gender_gap,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_age <- pool(as.mira(models_rq3_age))
+
+models_rq3_gender <- lapply(imp_pdata, function(pd) {
+  plm(flfp ~ gender_gap * income_group + pol_emp + fertility + age_dep,
+      data = pd, model = "within", effect = "twoways")
+})
+pooled_rq3_gender <- pool(as.mira(models_rq3_gender))
+
+lh_all_interactions <- wald_pool(rq3_full_dk,
+                                 c("pol_emp:income_groupMid tercile",    "pol_emp:income_groupHigh tercile",
+                                   "fertility:income_groupMid tercile",  "fertility:income_groupHigh tercile",
+                                   "age_dep:income_groupMid tercile",    "age_dep:income_groupHigh tercile",
+                                   "gender_gap:income_groupMid tercile", "gender_gap:income_groupHigh tercile"))
+lh_pol_emp    <- wald_pool(rq3_full_dk,
+                           c("pol_emp:income_groupMid tercile",   "pol_emp:income_groupHigh tercile"))
+lh_fertility  <- wald_pool(rq3_full_dk,
+                           c("fertility:income_groupMid tercile", "fertility:income_groupHigh tercile"))
+lh_age_dep    <- wald_pool(rq3_full_dk,
+                           c("age_dep:income_groupMid tercile",   "age_dep:income_groupHigh tercile"))
+lh_gender_gap <- wald_pool(rq3_full_dk,
+                           c("gender_gap:income_groupMid tercile","gender_gap:income_groupHigh tercile"))
+
+print(coef_by_income)
+print(lower_dk)
+print(middle_dk)
+print(higher_dk)
+print(rq3_full_dk)
+print(lh_all_interactions)
+print(lh_pol_emp)
+print(lh_fertility)
+print(lh_age_dep)
+print(lh_gender_gap)
+```
+
+## Tercile Summary Table
+
+```{r rq3-tercile-table}
+ci_low  <- data.frame(
+  CI_lower = lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] -
+    1.96 * lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"],
+  CI_upper = lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] +
+    1.96 * lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"]
+)
+ci_mid  <- data.frame(
+  CI_lower = middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] -
+    1.96 * middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"],
+  CI_upper = middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] +
+    1.96 * middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"]
+)
+ci_high <- data.frame(
+  CI_lower = higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] -
+    1.96 * higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"],
+  CI_upper = higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"] +
+    1.96 * higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "SE"]
+)
+
+tercile_table_compact <- data.frame(
+  Variable  = c("pol_emp","fertility","age_dep","gender_gap"),
+  Low_Coef  = round(lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3),
+  Low_CI    = paste0("[", round(ci_low$CI_lower, 2), ", ", round(ci_low$CI_upper, 2), "]"),
+  Low_p     = round(lower_dk[c("pol_emp","fertility","age_dep","gender_gap"), "p_value"], 3),
+  Mid_Coef  = round(middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3),
+  Mid_CI    = paste0("[", round(ci_mid$CI_lower, 2), ", ", round(ci_mid$CI_upper, 2), "]"),
+  Mid_p     = round(middle_dk[c("pol_emp","fertility","age_dep","gender_gap"), "p_value"], 3),
+  High_Coef = round(higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "Coefficient"], 3),
+  High_CI   = paste0("[", round(ci_high$CI_lower, 2), ", ", round(ci_high$CI_upper, 2), "]"),
+  High_p    = round(higher_dk[c("pol_emp","fertility","age_dep","gender_gap"), "p_value"], 3)
+)
+
+print(tercile_table_compact)
+```
+
+## Temporal Trend Plots
+
+```{r rq3-trends}
+temporal_trends <- imp1 %>%
+  group_by(year, income_group) %>%
+  summarise(mean_flfp    = mean(flfp,    na.rm = TRUE),
+            mean_pol_emp = mean(pol_emp, na.rm = TRUE),
+            .groups = "drop")
+
+p_flfp_trend <- ggplot(temporal_trends, aes(x = year, y = mean_flfp, colour = income_group)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  labs(x = "Year", y = "Mean FLFP (%)", colour = "Income Group") +
+  theme_minimal() + theme(legend.position = "bottom") +
+  scale_colour_manual(values = c("Low tercile"  = "#E69F00",
+                                 "Mid tercile"  = "#56B4E9",
+                                 "High tercile" = "#009E73"))
+
+ggsave("final_figure_A3a_flfp_trends.png", p_flfp_trend, width = 7, height = 4.5, dpi = 300)
+
+p_pol_trend <- ggplot(temporal_trends, aes(x = year, y = mean_pol_emp, colour = income_group)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  labs(x = "Year", y = "Mean Political Empowerment Index", colour = "Income Group") +
+  theme_minimal() + theme(legend.position = "bottom") +
+  scale_colour_manual(values = c("Low tercile"  = "#E69F00",
+                                 "Mid tercile"  = "#56B4E9",
+                                 "High tercile" = "#009E73"))
+
+ggsave("final_figure_A3b_pol_emp_trends.png", p_pol_trend, width = 7, height = 4.5, dpi = 300)
+
+print(p_flfp_trend)
+print(p_pol_trend)
+```
+
+# Robustness Checks
+
+## Within-Between Decomposition
+
+Standard `lmer` SEs used.
+
+```{r within-between-decomp}
+imp_list_decomp <- lapply(imp_list, function(df) {
+  df %>%
+    group_by(country) %>%
+    mutate(
+      pol_emp_cm    = mean(pol_emp,    na.rm = TRUE), pol_emp_dm    = pol_emp    - pol_emp_cm,
+      fertility_cm  = mean(fertility,  na.rm = TRUE), fertility_dm  = fertility  - fertility_cm,
+      age_dep_cm    = mean(age_dep,    na.rm = TRUE), age_dep_dm    = age_dep    - age_dep_cm,
+      gender_gap_cm = mean(gender_gap, na.rm = TRUE), gender_gap_dm = gender_gap - gender_gap_cm,
+      gdp_pc_cm     = mean(gdp_pc,     na.rm = TRUE), gdp_pc_dm     = gdp_pc     - gdp_pc_cm
+    ) %>%
+    ungroup()
+})
+
+models_decomp <- lapply(imp_list_decomp, function(df) {
+  lmer(flfp ~ pol_emp_dm + pol_emp_cm + fertility_dm + fertility_cm +
+         age_dep_dm + age_dep_cm + gender_gap_dm + gender_gap_cm +
+         gdp_pc_dm + gdp_pc_cm + factor(year) + (1 | country),
+       data = df, REML = FALSE)
+})
+
+fixef_avg <- Reduce(`+`, lapply(models_decomp, fixef)) / length(models_decomp)
+
+decomp_extracts <- lapply(models_decomp, function(m) {
+  est <- fixef(m)
+  se  <- sqrt(diag(vcov(m)))
+  data.frame(
+    term     = names(est),
+    estimate = as.numeric(est),
+    se       = as.numeric(se),
+    stringsAsFactors = FALSE
+  )
+})
+
+length(decomp_extracts)
+head(decomp_extracts[[1]])
+
+m_imp <- length(decomp_extracts)
+
+pooled_decomp <- bind_rows(decomp_extracts, .id = "imp") %>%
+  group_by(term) %>%
+  summarise(
+    estimate  = mean(estimate),
+    U_bar     = mean(se^2),
+    B         = var(estimate, na.rm = TRUE),
+    n_imps    = n(),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    B         = ifelse(is.na(B), 0, B),
+    T_var     = U_bar + (1 + 1/m_imp) * B,
+    pooled_se = sqrt(T_var),
+    t_stat    = estimate / pooled_se,
+    lambda    = (1 + 1/m_imp) * B / T_var,
+    lambda    = ifelse(is.na(lambda) | lambda == 0, 0.001, lambda),
+    df        = (m_imp - 1) / lambda^2,
+    p_value   = 2 * pt(abs(t_stat), df = df, lower.tail = FALSE),
+    ci_lower  = estimate - qt(0.975, df) * pooled_se,
+    ci_upper  = estimate + qt(0.975, df) * pooled_se
+  ) %>%
+  mutate(across(c(estimate, pooled_se, t_stat, p_value, ci_lower, ci_upper),
+                ~ round(.x, 3)))
+
+pooled_decomp %>% filter(term == "pol_emp_cm") %>% as.data.frame()
+```
+
+```{r within-between-table}
+wb_display <- pooled_decomp %>%
+  filter(grepl("_dm$|_cm$", term)) %>%
+  mutate(
+    variable    = gsub("_dm$|_cm$", "", term),
+    effect_type = ifelse(grepl("_dm$", term), "Within", "Between"),
+    ci_string   = paste0("[", round(ci_lower, 2), ", ", round(ci_upper, 2), "]")
+  ) %>%
+  dplyr::select(variable, effect_type, estimate, ci_string)
+
+wb_table <- wb_display %>%
+  pivot_wider(
+    names_from  = effect_type,
+    values_from = c(estimate, ci_string)
+  ) %>%
+  mutate(
+    Contextual = round(estimate_Between - estimate_Within, 3)
+  ) %>%
+  dplyr::select(
+    Variable         = variable,
+    Within           = estimate_Within,
+    `Within 95% CI`  = ci_string_Within,
+    Between          = estimate_Between,
+    `Between 95% CI` = ci_string_Between,
+    Contextual
+  )
+
+print(wb_table)
+write.csv(wb_table, "within_between_with_ci.csv", row.names = FALSE)
+```
+
+```{r within-between-plot}
+within_between_full <- pooled_decomp %>%
+  filter(grepl("_dm$|_cm$", term)) %>%
+  mutate(
+    variable    = gsub("_dm$|_cm$", "", term),
+    effect_type = ifelse(grepl("_dm$", term), "Within", "Between")
+  ) %>%
+  dplyr::select(variable, effect_type, estimate, ci_lower, ci_upper)
+
+p_within_between <- ggplot(within_between_full,
+                           aes(x = estimate, y = variable, fill = effect_type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(aes(xmin = ci_lower, xmax = ci_upper),
+                position = position_dodge(width = 0.7), width = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(x = "Effect on FLFP", y = "", fill = "Effect Type") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c("Within" = "#4575b4", "Between" = "#d73027"))
+
+ggsave("final_figure_3_3_within_between.png", p_within_between, width = 9, height = 5, dpi = 300)
+print(p_within_between)
+```
+
+## PLM Model Comparison (Pooled OLS vs RE vs FE)
+
+```{r model-comparison}
+imp1_decomp  <- imp_list_decomp[[1]]
+pdata_decomp <- pdata.frame(imp1_decomp, index = c("country", "year"))
+
+m_pooled <- plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc,
+                data = pdata_decomp, model = "pooling")
+m_re_plm <- plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc,
+                data = pdata_decomp, model = "random")
+m_fe_plm <- plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc,
+                data = pdata_decomp, model = "within")
+
+coef_comparison_plm <- data.frame(
+  Variable       = c("pol_emp","fertility","age_dep","gender_gap","gdp_pc"),
+  Pooled_OLS     = round(coef(m_pooled)[c("pol_emp","fertility","age_dep","gender_gap","gdp_pc")], 3),
+  Random_Effects = round(coef(m_re_plm)[c("pol_emp","fertility","age_dep","gender_gap","gdp_pc")], 3),
+  Fixed_Effects  = round(coef(m_fe_plm)[c("pol_emp","fertility","age_dep","gender_gap","gdp_pc")], 3)
+)
+
+hausman_test <- phtest(m_fe_plm, m_re_plm)
+
+fe_results  <- lapply(imp_list_decomp, function(df) { pd <- pdata.frame(df, index = c("country","year")); plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc, data = pd, model = "within")   })
+re_results  <- lapply(imp_list_decomp, function(df) { pd <- pdata.frame(df, index = c("country","year")); plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc, data = pd, model = "random")   })
+ols_results <- lapply(imp_list_decomp, function(df) { pd <- pdata.frame(df, index = c("country","year")); plm(flfp ~ pol_emp + fertility + age_dep + gender_gap + gdp_pc, data = pd, model = "pooling") })
+
+fe_pooled  <- MIcombine(results = lapply(fe_results,  function(m) structure(list(coefficients = coef(m), vcov = vcov(m)), class = "MIresult")))
+re_pooled  <- MIcombine(results = lapply(re_results,  function(m) structure(list(coefficients = coef(m), vcov = vcov(m)), class = "MIresult")))
+ols_pooled <- MIcombine(results = lapply(ols_results, function(m) structure(list(coefficients = coef(m), vcov = vcov(m)), class = "MIresult")))
+
+vars <- c("pol_emp","fertility","age_dep","gender_gap","gdp_pc")
+coef_comparison_pooled <- data.frame(
+  Variable       = vars,
+  Pooled_OLS     = round(ols_pooled$coefficients[vars], 3),
+  Random_Effects = round(re_pooled$coefficients[vars],  3),
+  Fixed_Effects  = round(fe_pooled$coefficients[vars],  3)
+)
+
+print(coef_comparison_pooled)
+print(coef_comparison_plm)
+print(hausman_test)
+```
+
+## Forest Plot: OLS vs RE vs FE (Headline Figure)
+
+```{r forest-plot}
+vars_plot <- c("pol_emp", "fertility", "age_dep", "gender_gap")
+
+var_labels <- c(
+  pol_emp    = "Political Empowerment",
+  fertility  = "Fertility",
+  age_dep    = "Age Dependency",
+  gender_gap = "Gender Gap (Tertiary)"
+)
+
+ols_se <- sqrt(diag(ols_pooled$variance))[vars_plot]
+re_se  <- sqrt(diag(re_pooled$variance))[vars_plot]
+fe_se  <- sqrt(diag(fe_pooled$variance))[vars_plot]
+
+forest_data <- data.frame(
+  variable = rep(vars_plot, 3),
+  model    = rep(c("Pooled OLS", "Random Effects", "Fixed Effects"), each = length(vars_plot)),
+  coef     = c(ols_pooled$coefficients[vars_plot],
+               re_pooled$coefficients[vars_plot],
+               fe_pooled$coefficients[vars_plot]),
+  se       = c(ols_se, re_se, fe_se)
+) %>%
+  mutate(
+    ci_lo  = coef - 1.96 * se,
+    ci_hi  = coef + 1.96 * se,
+    model  = factor(model, levels = c("Pooled OLS", "Random Effects", "Fixed Effects")),
+    var_label = factor(var_labels[variable], levels = rev(var_labels))
+  )
+
+p_forest <- ggplot(forest_data,
+                   aes(x = coef, y = var_label, colour = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = ci_lo, xmax = ci_hi),
+                  position = position_dodge(width = 0.5),
+                  size = 0.6) +
+  scale_colour_manual(values = c(
+    "Pooled OLS"     = "#d73027",
+    "Random Effects" = "#fc8d59",
+    "Fixed Effects"  = "#4575b4"
+  )) +
+  scale_shape_manual(values = c(
+    "Pooled OLS"     = 16,
+    "Random Effects" = 17,
+    "Fixed Effects"  = 15
+  )) +
+  labs(
+    x      = "Coefficient (effect on FLFP, percentage points)",
+    y      = NULL,
+    colour = NULL,
+    shape  = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("final_figure_3_2_coefficient_comparison.png", p_forest, width = 9, height = 5, dpi = 300)
+print(p_forest)
+```
+
+## Diagnostic Tests
+
+```{r diagnostics}
+m_for_bp <- lm(flfp ~ pol_emp + fertility + age_dep + gender_gap + factor(year), data = imp1)
+bp_test  <- bptest(m_for_bp)
+pbg_test <- pbgtest(m_fe_plm)
+pdw_test <- pdwtest(m_fe_plm)
+
+print(bp_test)
+print(pbg_test)
+print(pdw_test)
+```
+
+## Outlier Robustness
+
+```{r outlier-robustness}
+imp1_robust  <- imp1 %>% filter(flfp > 10 & flfp < 90)
+pdata_robust <- pdata.frame(imp1_robust, index = c("country","year"))
+m1_robust_fe <- plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+                    data = pdata_robust, model = "within", effect = "twoways")
+m1_robust_dk <- coeftest(m1_robust_fe,
+                         vcov = vcovSCC(m1_robust_fe, type = "HC1", cluster = "group"))
+
+print(m1_robust_dk)
+```
+
+## Listwise Deletion Comparison
+
+```{r listwise}
+df_complete      <- panel %>% drop_na(flfp, fertility, age_dep, gender_gap, pol_emp)
+n_full_panel     <- nrow(panel)
+n_complete_cases <- nrow(df_complete)
+pct_retained     <- round(n_complete_cases / n_full_panel * 100, 1)
+
+pdata_listwise   <- pdata.frame(df_complete, index = c("country","year"))
+m1_listwise_fe   <- plm(flfp ~ pol_emp + fertility + age_dep + gender_gap,
+                        data = pdata_listwise, model = "within", effect = "twoways")
+m1_listwise_dk   <- coeftest(m1_listwise_fe,
+                             vcov = vcovSCC(m1_listwise_fe, type = "HC1", cluster = "group"))
+
+print(m1_listwise_dk)
+print(paste("Full panel n:", n_full_panel,
+            "| Complete cases n:", n_complete_cases,
+            "| % retained:", pct_retained))
+```
+
+## Random Forest Importance (Robustness)
+
+```{r rf-robustness}
+clean_for_rf <- function(df) {
+  df %>% as.data.frame() %>%
+    drop_na(flfp, pol_emp, fertility, age_dep, gender_gap) %>%
+    mutate(year = as.numeric(year), year_fct = as.factor(year),
+           flfp = as.numeric(flfp), pol_emp = as.numeric(pol_emp),
+           fertility = as.numeric(fertility), age_dep = as.numeric(age_dep),
+           gender_gap = as.numeric(gender_gap))
+}
+
+rf_data1  <- clean_for_rf(imp_list[[1]])
+rf_data14 <- clean_for_rf(imp_list[[14]])
+rf_data28 <- clean_for_rf(imp_list[[28]])
+
+set.seed(456); rf_imp1  <- randomForest(flfp ~ pol_emp + fertility + age_dep + gender_gap + year_fct, data = rf_data1,  ntree = 500, importance = TRUE)
+set.seed(456); rf_imp14 <- randomForest(flfp ~ pol_emp + fertility + age_dep + gender_gap + year_fct, data = rf_data14, ntree = 500, importance = TRUE)
+set.seed(456); rf_imp28 <- randomForest(flfp ~ pol_emp + fertility + age_dep + gender_gap + year_fct, data = rf_data28, ntree = 500, importance = TRUE)
+
+print(importance(rf_imp1))
+print(importance(rf_imp14))
+print(importance(rf_imp28))
+```
+
+## Lagged Model
+
+```{r lagged-model}
+imp_list_lag <- lapply(imp_list, function(df) {
+  df %>%
+    arrange(country, year) %>%
+    group_by(country) %>%
+    mutate(pol_emp_lag1    = dplyr::lag(pol_emp,    1),
+           fertility_lag1  = dplyr::lag(fertility,  1),
+           age_dep_lag1    = dplyr::lag(age_dep,    1),
+           gender_gap_lag1 = dplyr::lag(gender_gap, 1)) %>%
+    ungroup()
+})
+
+imp_pdata_lag <- lapply(imp_list_lag, function(df)
+  pdata.frame(df, index = c("country","year")))
+
+models_lag <- lapply(imp_pdata_lag, function(pd) {
+  plm(flfp ~ pol_emp_lag1 + fertility_lag1 + age_dep_lag1 + gender_gap_lag1,
+      data = pd, model = "within", effect = "twoways")
+})
+
+lag_dk     <- pool_dk(models_lag)
+pooled_lag <- pool(as.mira(models_lag))
+
+pol_emp_contemp <- rq1_dk["pol_emp",      "Coefficient"]
+pol_emp_lagged  <- lag_dk["pol_emp_lag1", "Coefficient"]
+
+print(lag_dk)
+print(paste("Contemporaneous pol_emp:", round(pol_emp_contemp, 3),
+            "| Lagged pol_emp:", round(pol_emp_lagged, 3)))
+```
+
+# Coefficient Interpretation Reference Table
+
+```{r coef-reference-table}
+extract_dk <- function(dk_result, terms) {
+  data.frame(
+    term     = terms,
+    estimate = dk_result[terms, "Coefficient"],
+    se       = dk_result[terms, "SE"]
+  )
+}
+
+rq1_extract <- extract_dk(rq1_dk, c("pol_emp", "fertility", "age_dep", "gender_gap")) %>%
+  mutate(source = "RQ1: Main FE")
+
+rq2_extract <- extract_dk(rq2_dk, c("pol_emp", "age_dep", "fertility", "gender_gap",
+                                    "pol_emp:age_dep")) %>%
+  mutate(source = "RQ2: Interaction")
+
+rq3_low_extract  <- extract_dk(lower_dk,
+                               c("pol_emp", "fertility", "age_dep", "gender_gap")) %>%
+  mutate(source = "RQ3: Low tercile")
+rq3_mid_extract  <- extract_dk(middle_dk,
+                               c("pol_emp", "fertility", "age_dep", "gender_gap")) %>%
+  mutate(source = "RQ3: Mid tercile")
+rq3_high_extract <- extract_dk(higher_dk,
+                               c("pol_emp", "fertility", "age_dep", "gender_gap")) %>%
+  mutate(source = "RQ3: High tercile")
+
+wb_extract <- pooled_decomp %>%
+  filter(grepl("_dm$|_cm$", term)) %>%
+  mutate(
+    source = ifelse(grepl("_dm$", term),
+                    "Within-between: Within",
+                    "Within-between: Between"),
+    term = gsub("_dm$|_cm$", "", term)
+  ) %>%
+  dplyr::select(term, estimate, se = pooled_se, source)
+
+all_coefs <- bind_rows(rq1_extract, rq2_extract,
+                       rq3_low_extract, rq3_mid_extract, rq3_high_extract,
+                       wb_extract)
+
+unit_changes <- data.frame(
+  base_var      = c("pol_emp", "fertility", "age_dep", "gender_gap",
+                    "log_gdp_pc", "gdp_pc"),
+  unit_change   = c(0.1, 1, 10, 10, 0.01, 1000),
+  unit_label    = c("0.1-unit increase",
+                    "1 additional child per woman",
+                    "10-point increase in dependency ratio",
+                    "10-point increase in tertiary gender gap",
+                    "1% increase in GDP per capita",
+                    "$1,000 increase in GDP per capita")
+)
+
+reference_table <- all_coefs %>%
+  mutate(
+    base_var = case_when(
+      grepl("pol_emp:age_dep", term)   ~ "pol_emp",
+      grepl("^pol_emp$",  term)        ~ "pol_emp",
+      grepl("^fertility$", term)       ~ "fertility",
+      grepl("^age_dep$",  term)        ~ "age_dep",
+      grepl("^gender_gap$", term)      ~ "gender_gap",
+      grepl("^gdp_pc$",   term)        ~ "gdp_pc",
+      grepl("^log_gdp_pc$", term)      ~ "log_gdp_pc",
+      TRUE ~ term
+    )
+  ) %>%
+  left_join(unit_changes, by = "base_var") %>%
+  mutate(
+    translated_effect   = estimate * unit_change,
+    ci_lower_translated = (estimate - 1.96 * se) * unit_change,
+    ci_upper_translated = (estimate + 1.96 * se) * unit_change
+  ) %>%
+  dplyr::select(source, variable = term, raw_coef = estimate, se,
+                unit_label, translated_effect,
+                ci_lower_translated, ci_upper_translated) %>%
+  mutate(across(c(raw_coef, se, translated_effect,
+                  ci_lower_translated, ci_upper_translated),
+                ~ round(.x, 3)))
+
+print(as.data.frame(reference_table))
+write.csv(reference_table, "coefficient_reference_table.csv", row.names = FALSE)
+```
